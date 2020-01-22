@@ -15,10 +15,12 @@ use {DataLinkReceiver, DataLinkSender, MacAddr, NetworkInterface};
 
 use pnet_sys;
 
+use std::cell::RefCell;
 use std::cmp;
 use std::io;
 use std::mem;
 use std::ptr;
+use std::rc::Rc;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -41,7 +43,7 @@ fn network_addr_to_sockaddr(
 }
 
 /// Configuration for the Linux datalink backend.
-#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+#[derive(Clone)]
 pub struct Config {
     /// The size of buffer to use when writing packets. Defaults to 4096.
     pub write_buffer_size: usize,
@@ -62,6 +64,11 @@ pub struct Config {
 
     /// Specifies packet fanout option, if desired. Defaults to None.
     pub fanout: Option<super::FanoutOption>,
+
+    /// A sockaddr_storage to be filled when calling recv_from.
+    /// **Must** be zeroed.
+    /// If None, the sockaddr_ll will be ignored.
+    pub recv_sockaddr_storage: Option<Rc<RefCell<libc::sockaddr_storage>>>
 }
 
 impl<'a> From<&'a super::Config> for Config {
@@ -73,6 +80,7 @@ impl<'a> From<&'a super::Config> for Config {
             read_timeout: config.read_timeout,
             write_timeout: config.write_timeout,
             fanout: config.linux_fanout,
+            recv_sockaddr_storage: None
         }
     }
 }
@@ -86,6 +94,7 @@ impl Default for Config {
             write_timeout: None,
             channel_type: super::ChannelType::Layer2,
             fanout: None,
+            recv_sockaddr_storage: None
         }
     }
 }
@@ -210,6 +219,7 @@ pub fn channel(network_interface: &NetworkInterface, config: Config) -> io::Resu
         timeout: config
             .read_timeout
             .map(|to| pnet_sys::duration_to_timespec(to)),
+        recv_sockaddr_storage: config.recv_sockaddr_storage.unwrap_or(Rc::new(RefCell::new(unsafe{ mem::zeroed() })))
     });
 
     Ok(super::Channel::Ethernet(sender, receiver))
@@ -325,11 +335,13 @@ struct DataLinkReceiverImpl {
     read_buffer: Vec<u8>,
     _channel_type: super::ChannelType,
     timeout: Option<libc::timespec>,
+    recv_sockaddr_storage: Rc<RefCell<libc::sockaddr_storage>>
 }
+
+unsafe impl Send for DataLinkReceiverImpl {}
 
 impl DataLinkReceiver for DataLinkReceiverImpl {
     fn next(&mut self) -> io::Result<&[u8]> {
-        let mut caddr: libc::sockaddr_storage = unsafe { mem::zeroed() };
         unsafe {
             libc::FD_ZERO(&mut self.fd_set as *mut libc::fd_set);
             libc::FD_SET(self.socket.fd, &mut self.fd_set as *mut libc::fd_set);
@@ -352,7 +364,7 @@ impl DataLinkReceiver for DataLinkReceiverImpl {
         } else if ret == 0 {
             Err(io::Error::new(io::ErrorKind::TimedOut, "Timed out"))
         } else {
-            let res = pnet_sys::recv_from(self.socket.fd, &mut self.read_buffer, &mut caddr);
+            let res = pnet_sys::recv_from(self.socket.fd, &mut self.read_buffer, self.recv_sockaddr_storage.as_ptr());
             match res {
                 Ok(len) => Ok(&self.read_buffer[0..len]),
                 Err(e) => Err(e),
